@@ -1,0 +1,9 @@
+{
+  "name": "skill-finder",
+  "description": "智能技能发现与路由系统。通过领域知识图谱 + Sentence-Transformer Embedding 语义重排序，用自然语言精准找到最适合的 skill。支持多意图查询自动拆解、自举索引、纯本地运行。",
+  "version": "1.3.0",
+  "license": "MIT",
+  "author": "sg1997k",
+  "homepage": "https://github.com/sg1997k/skill-finder",
+  "tags": ["skill-discovery", "rag", "knowledge-graph", "semantic-search", "embedding"]
+}
