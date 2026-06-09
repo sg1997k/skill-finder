@@ -1,11 +1,12 @@
 ---
 name: skill-finder
 description: >
-  智能技能发现与路由系统。通过领域知识图谱 + TF-IDF 语义重排序实现自然语言到技能包的精准路由。
+  智能技能发现与路由系统。通过领域知识图谱 + Sentence-Transformer Embedding 语义重排序实现自然语言到技能包的精准路由。
+  使用 intfloat/multilingual-e5-small 模型（384维向量），支持中英文混合查询。
   支持多意图查询（如"分析财报并画图"）自动拆解并按执行顺序返回跨领域技能包。
-  首次运行自动扫描本地所有 SKILL.md 建立索引（自举），之后查询 < 1ms。
+  首次运行自动扫描本地所有 SKILL.md 建立索引并下载模型（自举），之后查询秒级响应。
   触发场景：用户需要找技能、不确定用什么技能、任务需要多个技能协作完成。
-version: 1.2.0
+version: 1.3.0
 agent_created: true
 ---
 
@@ -52,8 +53,8 @@ python {SKILL_DIR}/scripts/bootstrap.py "<用户原始请求>"
 ```
 
 脚本自动处理：
-- **首次运行**：扫描本地全部 SKILL.md → 建立领域索引 + TF-IDF 语义库 → 执行查询（约 2-3 秒）
-- **已有索引**：直接查询（< 1 秒）
+- **首次运行**：扫描本地全部 SKILL.md → 建立领域索引 + 下载模型 + 计算 embedding → 执行查询（约 2-3 分钟）
+- **已有索引**：直接加载缓存查询（约 2-3 秒，含模型推理）
 - **输出**：JSON 格式的候选技能列表（见下方输出格式）
 
 ### Step 2：解读结果，做出决策
@@ -169,20 +170,21 @@ npx skills add {skill_name}
 **关键字段说明：**
 - `is_multi_intent`: 是否为多意图查询
 - `execution_plan`: **多意图时必看**——按 Step 顺序执行，每个 Step 对应一个领域
-- `rag_score`: TF-IDF 语义相似度得分（0~1，越高越相关）
+- `rag_score`: 向量余弦相似度得分（0~1，越高越相关）
 - `expanded_domains`: 知识图谱扩展后的领域范围
 
 ---
 
-## RAG 语义重排序（了解即可）
+## Embedding 语义重排序（了解即可）
 
-脚本在域内使用 **TF-IDF + 余弦相似度** 对候选技能做语义重排序：
+脚本在域内使用 **Sentence-Transformer Embedding + 余弦相似度** 对候选技能做语义重排序：
 
-1. **建索引时**：对所有技能包的 description 建立 TF-IDF 词频-逆文档频率模型
-2. **查询时**：将用户 query 和每个 skill 的 description 转为 TF-IDF 向量
-3. **排序**：计算余弦相似度，得分高的排前面
+1. **模型**：`intfloat/multilingual-e5-small`（384 维向量，支持中英文）
+2. **建索引时**：对所有技能包的 description 计算 embedding 向量，缓存到 `data/embeddings.npy`
+3. **查询时**：将用户 query 转为 embedding，与域内候选技能的 embedding 计算余弦相似度
+4. **排序**：得分高的排前面，top-k 返回
 
-**优势**：纯 Python 实现，零外部依赖，无需联网，< 1ms 完成排序。
+**优势**：真正的语义理解，同义词、近义词自动匹配。"预约会议"能精准命中 `tencent-meeting-mcp`，"股票走势"命中 `westock-data`。查询延迟 < 2 秒（含模型推理）。
 
 ---
 
@@ -222,7 +224,7 @@ ls ~/.workbuddy/skills/{skill_name}/ 2>/dev/null && echo "installed" || echo "no
 
 | 情况 | 处理方式 |
 |---|---|
-| bootstrap.py 运行失败 | 确认使用 Python 3.8+；脚本无需任何外部包 |
+| bootstrap.py 运行失败 | 确认 Python 3.8+；需安装 `sentence-transformers` + `numpy`（脚本自动安装） |
 | 脚本找不到任何 SKILL.md | 检查 `SKILL_SCAN_PATHS`，确认路径存在 |
 | 输出 `skill_count: 0` | 用户查询过短，引导用户补充描述 |
 | 安装失败 | 告知用户技能名，请用户手动安装 |
@@ -238,10 +240,11 @@ ls ~/.workbuddy/skills/{skill_name}/ 2>/dev/null && echo "installed" || echo "no
 2. 提取每个 skill 的 `name` + `description` 字段
 3. 按 13 个语义领域的关键词规则分类
 4. 构建领域邻接图（查金融 → 自动扩展数据可视化等相邻域）
-5. 构建 TF-IDF 语义索引（用于域内 RAG 重排序）
-6. 缓存到 `data/skill_domains.json`（含 mtime，支持增量更新）
+5. **下载 embedding 模型** `intfloat/multilingual-e5-small`（~120MB，仅首次）
+6. **计算所有 skill description 的向量**，存入 `data/embeddings.npy`
+7. 缓存到 `data/skill_domains.json`（含 mtime，支持增量更新）
 
-之后每次查询直接走缓存，< 1ms。
+之后每次查询直接加载缓存 + 模型，秒级响应。
 
 ---
 

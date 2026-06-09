@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Skill Finder — Self-Bootstrapping Semantic Domain Router with RAG
+Skill Finder — Self-Bootstrapping Semantic Domain Router with Embedding RAG
 
 First run: scans all SKILL.md files, extracts frontmatter, classifies into
-semantic domains, builds TF-IDF corpus for in-domain RAG re-ranking,
-saves index to data/skill_domains.json.
+semantic domains, builds sentence-transformer embeddings for semantic ranking,
+saves index to data/skill_domains.json + data/embeddings.npy.
 
-Subsequent runs: loads cached index, routes query via keyword + graph expansion,
-then re-ranks within matched domains using TF-IDF cosine similarity.
+Subsequent runs: loads cached index + embeddings, routes query via keyword + graph
+expansion, then re-ranks within matched domains using embedding cosine similarity.
 Supports multi-intent queries (e.g. "analyze data and draw a chart") by
 returning ordered skills from multiple domains.
 
@@ -25,6 +25,7 @@ import re
 import sys
 import time
 import math
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -33,7 +34,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 DATA_DIR = SKILL_DIR / "data"
 INDEX_FILE = DATA_DIR / "skill_domains.json"
-TFIDF_FILE = DATA_DIR / "tfidf_cache.json"
+EMBEDDING_FILE = DATA_DIR / "embeddings.npy"
 
 # Paths to scan for SKILL.md files (platform-agnostic)
 HOME = Path.home()
@@ -44,6 +45,150 @@ SKILL_SCAN_PATHS = [
     HOME / ".codebuddy" / "skills",
     HOME / ".codebuddy" / "plugins",
 ]
+
+# ── Embedding Model Config ─────────────────────────────────────────
+# Multilingual model with strong Chinese + English support, 384-dim
+EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
+EMBEDDING_DIM = 384
+
+# Local model path (auto-downloaded on first run)
+LOCAL_MODEL_DIR = DATA_DIR / "model"
+
+# Lazy-loaded model reference
+_embed_model = None
+_np = None  # numpy, lazy import
+
+def _ensure_numpy():
+    global _np
+    if _np is None:
+        import numpy
+        _np = numpy
+    return _np
+
+def _ensure_local_model():
+    """Ensure the embedding model is available locally.
+    Downloads to data/model/ if not present (avoids HF symlink issues on Windows)."""
+    if LOCAL_MODEL_DIR.exists() and (LOCAL_MODEL_DIR / "modules.json").exists():
+        return str(LOCAL_MODEL_DIR)
+
+    print(f"Embedding model not found locally. Downloading {EMBEDDING_MODEL_NAME}...", file=sys.stderr)
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        python_exe = sys.executable
+        subprocess.check_call(
+            [python_exe, "-m", "pip", "install", "huggingface_hub", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        from huggingface_hub import snapshot_download
+
+    LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_download(EMBEDDING_MODEL_NAME, local_dir=str(LOCAL_MODEL_DIR))
+    print("Model downloaded.", file=sys.stderr)
+    return str(LOCAL_MODEL_DIR)
+
+def _ensure_sentence_transformers():
+    """Ensure sentence-transformers is installed. Auto-install if missing."""
+    global _embed_model
+    if _embed_model is not None:
+        return _embed_model
+
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        print("Installing sentence-transformers (one-time setup)...", file=sys.stderr)
+        python_exe = sys.executable
+        subprocess.check_call(
+            [python_exe, "-m", "pip", "install", "sentence-transformers", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        from sentence_transformers import SentenceTransformer
+
+    model_path = _ensure_local_model()
+    print(f"Loading embedding model from: {model_path}...", file=sys.stderr)
+    _embed_model = SentenceTransformer(model_path)
+    print("Embedding model loaded.", file=sys.stderr)
+    return _embed_model
+
+def compute_embeddings(texts, batch_size=64):
+    """Compute embeddings for a list of texts using sentence-transformers."""
+    model = _ensure_sentence_transformers()
+    np = _ensure_numpy()
+    if not texts:
+        return np.array([], dtype=np.float32)
+    embeddings = model.encode(texts, batch_size=batch_size, show_progress_bar=False,
+                              normalize_embeddings=True)
+    return embeddings.astype(np.float32)
+
+def compute_query_embedding(query):
+    """Compute normalized embedding for a single query."""
+    model = _ensure_sentence_transformers()
+    np = _ensure_numpy()
+    emb = model.encode([query], normalize_embeddings=True)
+    return emb[0].astype(np.float32)
+
+def embedding_cosine_similarity(query_emb, skill_embs):
+    """
+    Compute cosine similarity between query embedding and all skill embeddings.
+    Both are already L2-normalized, so dot product = cosine similarity.
+    Returns list of (index, score) sorted by descending score.
+    """
+    np = _ensure_numpy()
+    if len(skill_embs) == 0:
+        return []
+    scores = np.dot(skill_embs, query_emb)
+    # Get indices sorted by descending score
+    sorted_indices = np.argsort(-scores)
+    return [(int(i), float(scores[i])) for i in sorted_indices]
+
+def semantic_rank_embedding(query, skills, skill_embeddings, top_n=20):
+    """
+    Rank skills by embedding cosine similarity to the query.
+    Returns list of (skill, score) sorted by descending score.
+    """
+    if not skills or len(skill_embeddings) == 0:
+        return [(s, 0.0) for s in skills]
+
+    query_emb = compute_query_embedding(query)
+
+    # Build descriptions for the skills we're ranking
+    skill_texts = []
+    for skill in skills:
+        desc = skill.get('description', '') or ''
+        name = skill.get('name', '') or ''
+        skill_texts.append(desc + ' ' + name)
+
+    # Compute embeddings for these skills (or use cached ones)
+    np = _ensure_numpy()
+    skill_embs = compute_embeddings(skill_texts, batch_size=min(64, len(skill_texts)))
+
+    # Cosine similarity
+    scores = np.dot(skill_embs, query_emb)
+
+    scored = [(skills[i], float(scores[i])) for i in range(len(skills))]
+    scored.sort(key=lambda x: -x[1])
+    return scored[:top_n]
+
+def semantic_rank_cached(query, skill_indices, full_embeddings, all_skills, top_n=20):
+    """
+    Rank skills using pre-cached embeddings (from embedding file).
+    `skill_indices`: list of global indices into full_embeddings
+    `full_embeddings`: numpy array of all skill embeddings
+    `all_skills`: full list of skills matching the embedding array
+    Returns list of (skill, score) sorted by descending score.
+    """
+    np = _ensure_numpy()
+    if not skill_indices or full_embeddings is None or len(full_embeddings) == 0:
+        return [(all_skills[i], 0.0) for i in skill_indices]
+
+    query_emb = compute_query_embedding(query)
+    subset_embs = full_embeddings[skill_indices]
+    scores = np.dot(subset_embs, query_emb)
+
+    scored = [(all_skills[skill_indices[i]], float(scores[i])) for i in range(len(skill_indices))]
+    scored.sort(key=lambda x: -x[1])
+    return scored[:top_n]
+
 
 # ── Domain Definitions ─────────────────────────────────────────────────────
 DOMAINS = [
@@ -320,7 +465,7 @@ DOMAIN_ROUTING = {
                      "柱状图", "饼图", "K线图", "趋势图", "map", "chart",
                      "visualize", "graph", "plot", "dashboard", "画图表",
                      "数据图", "统计图", "走势图", "饼状图", "散点图",
-                     "画", "图"],   # standalone chars match "画个图", "画个"
+                     "画", "图"],
     },
     "document_processing": {
         "trigger": ["word", "excel", "ppt", "pdf", "文档", "表格", "幻灯片",
@@ -357,7 +502,8 @@ DOMAIN_ROUTING = {
     },
     "communication": {
         "trigger": ["邮件", "通知", "消息", "通讯", "日程", "会议记录",
-                     "email", "notify", "message", "calendar", "meeting"],
+                     "email", "notify", "message", "calendar", "meeting",
+                     "会议", "预约", "腾讯会议", "日程安排"],
     },
     "academic_research": {
         "trigger": ["论文", "学术", "文献", "期刊", "arXiv", "引用", "综述",
@@ -372,123 +518,13 @@ DOMAIN_ROUTING = {
     },
     "life_sciences": {
         "trigger": ["基因", "蛋白质", "药物", "医学", "临床", "生物",
-                     "genomic", "protein", "drug", "clinical", "bio", "pharma"],
+                     "genomic", "protein", "drug", "clinical", "bio", "pharma",
+                     "CRISPR", "DNA", "RNA", "细胞", "分子", "enzyme",
+                     "基因组", "测序", "病理", "诊断", "疫苗"],
     },
 }
 
 MIN_SCORE = 8
-
-# ── Zero-Dependency TF-IDF Semantic Similarity ────────────────────────
-#
-# Tokenizer: splits on word boundaries + extracts Chinese characters.
-# IDF is computed once at index build time and cached.
-# Cosine similarity of TF-IDF vectors gives semantic ranking.
-# Handles both Chinese and English text.
-
-def tokenize(text):
-    """
-    Tokenize text into words + Chinese character bigrams.
-    Uses character-level bigrams for Chinese (captures more semantic signal
-    than single chars), and word-level tokens for ASCII.
-    Returns a list of tokens.
-    """
-    if not text:
-        return []
-    text = text.lower()
-    tokens = []
-
-    # Extract ASCII words (English, numbers, coding terms)
-    for word in re.findall(r'[a-z0-9_]+', text):
-        if len(word) >= 2:
-            tokens.append(word)
-
-    # Extract Chinese characters
-    chinese_chars = [ch for ch in text if '\u4e00' <= ch <= '\u9fff']
-
-    # Add single Chinese chars
-    for ch in chinese_chars:
-        tokens.append(ch)
-
-    # Add Chinese character bigrams (captures local word semantics)
-    for i in range(len(chinese_chars) - 1):
-        tokens.append(chinese_chars[i] + chinese_chars[i + 1])
-
-    return tokens
-
-
-def build_idf(skills):
-    """
-    Build IDF (Inverse Document Frequency) from all skill descriptions.
-    Returns: { token: idf_value }
-    """
-    N = len(skills)
-    doc_freq = Counter()
-
-    for skill in skills:
-        desc = skill.get('description', '') or ''
-        name = skill.get('name', '') or ''
-        text = desc + ' ' + name
-        tokens = set(tokenize(text))
-        for t in tokens:
-            doc_freq[t] += 1
-
-    idf = {}
-    for token, df in doc_freq.items():
-        if df > 0:
-            idf[token] = math.log((N + 1) / (df + 1)) + 1  # smooth
-    return idf
-
-
-def tfidf_vector(text, idf):
-    """
-    Compute TF-IDF vector as a Counter { token: tfidf }.
-    Only includes tokens present in the IDF vocabulary.
-    """
-    tokens = tokenize(text)
-    if not tokens:
-        return Counter()
-    tf = Counter(tokens)
-    max_tf = max(tf.values())
-    vec = Counter()
-    for t, cnt in tf.items():
-        if t in idf:
-            tf_norm = cnt / max_tf
-            vec[t] = tf_norm * idf[t]
-    return vec
-
-
-def cosine_similarity(vec1, vec2):
-    """Cosine similarity between two Counter vectors."""
-    if not vec1 or not vec2:
-        return 0.0
-    dot = sum(vec1[t] * vec2.get(t, 0) for t in vec1)
-    norm1 = math.sqrt(sum(v * v for v in vec1.values()))
-    norm2 = math.sqrt(sum(v * v for v in vec2.values()))
-    if norm1 == 0 or norm2 == 0:
-        return 0.0
-    return dot / (norm1 * norm2)
-
-
-def semantic_rank(query, skills, idf, top_n=20):
-    """
-    Rank skills by semantic similarity to the query using TF-IDF cosine.
-    Returns list of (skill, score) sorted by descending score.
-    """
-    query_vec = tfidf_vector(query, idf)
-    if not query_vec:
-        return [(s, 0.0) for s in skills]
-
-    scored = []
-    for skill in skills:
-        desc = skill.get('description', '') or ''
-        name = skill.get('name', '') or ''
-        text = desc + ' ' + name
-        skill_vec = tfidf_vector(text, idf)
-        sim = cosine_similarity(query_vec, skill_vec)
-        scored.append((skill, sim))
-
-    scored.sort(key=lambda x: -x[1])
-    return scored[:top_n]
 
 
 # ── YAML Frontmatter Extraction ──────────────────────────────────────────
@@ -574,8 +610,8 @@ def classify_skill(desc, name):
 
 
 def build_index(force=False):
-    """Build or rebuild the domain index, including TF-IDF cache."""
-    if not force and INDEX_FILE.exists():
+    """Build or rebuild the domain index, including embedding cache."""
+    if not force and INDEX_FILE.exists() and EMBEDDING_FILE.exists():
         cached = _load_index()
         if cached:
             return cached
@@ -603,27 +639,41 @@ def build_index(force=False):
             'secondary_domains': secondary,
         })
 
-    # Build TF-IDF IDF cache for semantic ranking
-    print("Building TF-IDF semantic index...", file=sys.stderr)
-    idf = build_idf(results)
-    print(f"TF-IDF vocabulary size: {len(idf)}", file=sys.stderr)
+    # Build embedding cache for semantic ranking
+    print(f"Building embedding index with {EMBEDDING_MODEL_NAME}...", file=sys.stderr)
+    skill_texts = []
+    for skill in results:
+        desc = skill.get('description', '') or ''
+        name = skill.get('name', '') or ''
+        skill_texts.append(desc + ' ' + name)
+
+    embeddings = compute_embeddings(skill_texts)
+    print(f"Embeddings computed: {embeddings.shape}", file=sys.stderr)
 
     output = {
         'built_at': time.time(),
         'total_skills': len(skills),
+        'embedding_model': EMBEDDING_MODEL_NAME,
+        'embedding_dim': EMBEDDING_DIM,
         'domains': [{'id': d['id'], 'name': d['name'], 'description': d['desc']} for d in DOMAINS],
         'skills': results,
         'summary': {d['id']: {'name': d['name'], 'count': domain_counts[d['id']]} for d in DOMAINS},
         'other_count': domain_counts['other'],
-        'tfidf_idf': idf,   # cached IDF for query-time ranking
     }
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(INDEX_FILE, 'w', encoding='utf-8') as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
+    # Save embeddings as numpy binary file
+    np = _ensure_numpy()
+    np.save(str(EMBEDDING_FILE), embeddings)
+
     elapsed = time.time() - t0
-    print(f"Index built in {elapsed:.1f}s ({len(skills)} skills, {sum(1 for c in domain_counts.values() if c > 0)} domains)",
+    idx_size_mb = EMBEDDING_FILE.stat().st_size / (1024 * 1024) if EMBEDDING_FILE.exists() else 0
+    print(f"Index built in {elapsed:.1f}s ({len(skills)} skills, "
+          f"{sum(1 for c in domain_counts.values() if c > 0)} domains, "
+          f"embeddings: {idx_size_mb:.1f}MB)",
           file=sys.stderr)
 
     return output
@@ -636,6 +686,17 @@ def _load_index():
             return json.load(f)
     except Exception:
         return None
+
+
+def _load_embeddings():
+    """Load cached embeddings from .npy file. Returns numpy array or None."""
+    try:
+        if EMBEDDING_FILE.exists():
+            np = _ensure_numpy()
+            return np.load(str(EMBEDDING_FILE))
+    except Exception:
+        pass
+    return None
 
 
 # ── Multi-Intent Detection ────────────────────────────────────────────────
@@ -657,7 +718,6 @@ DOMAIN_EXEC_ORDER = {
     "game_development":        6,
     "workbuddy_meta":          7,
 }
-
 
 # Multi-intent filtering: only keep domains with score >= ratio of max score
 MULTI_INTENT_SCORE_RATIO = 0.25  # keep domain if score >= 25% of top domain
@@ -697,14 +757,14 @@ def detect_multi_intent(query, domain_scores):
     return ordered
 
 
-# ── Query Routing (Enhanced) ─────────────────────────────────────────────
+# ── Query Routing (Enhanced with Embedding RAG) ─────────────────────────
 
 def route_query(query, data, expand_depth=1, use_rag=True):
     """
     Route a query to domains and return matching skills.
     Enhanced with:
       - Multi-intent detection (returns skills from multiple domains in exec order)
-      - In-domain RAG re-ranking (TF-IDF semantic similarity)
+      - In-domain RAG re-ranking (sentence-transformer embedding similarity)
     """
     query_lower = query.lower()
 
@@ -748,16 +808,29 @@ def route_query(query, data, expand_depth=1, use_rag=True):
     seen = set()
     execution_plan = []
 
+    # Load cached embeddings for fast ranking
+    full_embeddings = None
+    if use_rag:
+        full_embeddings = _load_embeddings()
+
+    # Build global index map: skill name → global index
+    name_to_idx = {}
+    all_skills_list = data['skills']
+    for i, s in enumerate(all_skills_list):
+        name_to_idx[s['name']] = i
+
     # For multi-intent: return top skills from each matched domain in order
     if len(primary_ids) > 1:
         for domain_id in primary_ids:
             domain_skills = [s for s in data['skills']
                             if s['primary_domain'] == domain_id and s['name'] not in seen]
-            # RAG re-ranking within domain
-            if use_rag and domain_skills:
-                idf = data.get('tfidf_idf', {})
-                ranked = semantic_rank(query, domain_skills, idf, top_n=5)
-                step_skills = []
+            step_skills = []
+            if use_rag and domain_skills and full_embeddings is not None:
+                # Use cached embedding ranking
+                indices = [name_to_idx[s['name']] for s in domain_skills
+                          if s['name'] in name_to_idx]
+                ranked = semantic_rank_cached(query, indices, full_embeddings,
+                                              all_skills_list, top_n=5)
                 for skill, score in ranked:
                     if skill['name'] not in seen:
                         seen.add(skill['name'])
@@ -765,7 +838,6 @@ def route_query(query, data, expand_depth=1, use_rag=True):
                         step_skills.append(skill)
                         all_skills.append(skill)
             else:
-                step_skills = []
                 for s in domain_skills[:5]:
                     if s['name'] not in seen:
                         seen.add(s['name'])
@@ -785,9 +857,11 @@ def route_query(query, data, expand_depth=1, use_rag=True):
                     seen.add(skill['name'])
                     all_skills.append(skill)
 
-        if use_rag and all_skills:
-            idf = data.get('tfidf_idf', {})
-            ranked = semantic_rank(query, all_skills, idf, top_n=20)
+        if use_rag and all_skills and full_embeddings is not None:
+            indices = [name_to_idx[s['name']] for s in all_skills
+                      if s['name'] in name_to_idx]
+            ranked = semantic_rank_cached(query, indices, full_embeddings,
+                                          all_skills_list, top_n=20)
             all_skills = []
             for skill, score in ranked:
                 skill['rag_score'] = round(score, 4)
@@ -798,7 +872,7 @@ def route_query(query, data, expand_depth=1, use_rag=True):
         'matched_domains': [{'id': d, 'name': domain_name_map.get(d, d)} for d in primary_ids],
         'expanded_domains': [{'id': d, 'name': domain_name_map.get(d, d)} for d in sorted(expanded)],
         'is_multi_intent': len(primary_ids) > 1,
-        'execution_plan': execution_plan,   # NEW: ordered steps for multi-intent
+        'execution_plan': execution_plan,
         'skill_count': len(all_skills),
         'skills': all_skills[:50],
     }
@@ -820,7 +894,7 @@ def format_results(result, top_n=10):
     lines.append(f"[扩展域] 邻接扩展: {', '.join(d['name'] for d in ed)}")
     if multi:
         lines.append("[模式] 多意图检测：按执行顺序返回跨领域 skill")
-    lines.append(f"[候选] skill 数: {result['skill_count']} (从 1836 缩小到 {result['skill_count']})")
+    lines.append(f"[候选] skill 数: {result['skill_count']}")
     lines.append("")
     lines.append(f"Top {top_n} skills in matched domains:")
 
@@ -829,7 +903,7 @@ def format_results(result, top_n=10):
         secondary = ', '.join(s.get('secondary_domains', []))
         extra = f" [also: {secondary}]" if secondary else ""
         rag = s.get('rag_score', '')
-        rag_str = f" [RAG:{rag:.3f}]" if rag else ""
+        rag_str = f" [Emb:{rag:.3f}]" if rag else ""
         lines.append(f"  * {s['name']} ({domain_name}{extra}){rag_str}")
 
     if len(result['skills']) > top_n:
@@ -844,14 +918,19 @@ def print_stats(data):
     print("  Skill Finder — Domain Statistics")
     print("=" * 60)
     print(f"  Total skills indexed: {data['total_skills']}")
+    emb_model = data.get('embedding_model', 'TF-IDF')
+    emb_dim = data.get('embedding_dim', 'N/A')
+    print(f"  Embedding model: {emb_model} ({emb_dim}d)")
     print()
     for d in data['domains']:
         cnt = data['summary'][d['id']]['count']
         name = d['name']
         print(f"  {name:20s}  {cnt:5d} skills")
     print(f"  {'其他':20s}  {data['other_count']:5d} skills")
-    idf_size = len(data.get('tfidf_idf', {}))
-    print(f"\n  TF-IDF vocabulary: {idf_size} tokens")
+
+    if EMBEDDING_FILE.exists():
+        emb_size = EMBEDDING_FILE.stat().st_size / (1024 * 1024)
+        print(f"\n  Embedding cache: {emb_size:.1f} MB")
 
 
 def print_domains(data):
@@ -864,30 +943,53 @@ def print_domains(data):
 
 
 def test_rag_quality(data):
-    """Test RAG ranking quality with sample queries."""
+    """Test embedding RAG ranking quality with sample queries."""
     test_cases = [
+        # (query, expected_domain, expected_top_skills)
         ("分析A股消费板块走势", "finance_investment", ["westock-data", "neodata-financial-search"]),
-        ("画个K线图", "data_visualization", ["data_visualization"]),
-        ("帮我发一封邮件", "communication", ["qq-mail"]),
-        ("写一个React登录组件", "software_development", ["software_development"]),
-        ("分析财报并画图表", "finance_investment", ["finance_investment", "data_visualization"]),
+        ("帮我处理一个PDF转Word", "document_processing", ["pdf", "docx"]),
+        ("画一个销售数据的趋势图表", "data_visualization", ["data_visualization"]),
+        ("帮我发一封邮件通知团队", "communication", ["qq-mail"]),
+        ("写一个React注册登录页面", "software_development", ["github", "playwright-cli"]),
+        ("帮我预约一个腾讯会议", "communication", ["tencent-meeting-skill"]),
+        ("训练一个图像分类模型", "data_science_ml", ["arxiv-reader"]),
+        ("我需要找一篇关于CRISPR的论文", "life_sciences", []),
+        ("帮我设计一个LOGO和海报", "content_design", ["libtv-skill"]),
+        ("Excel表格数据分析", "document_processing", ["xlsx"]),
+        ("帮我写一个微信公众号文章", "content_design", ["libtv-skill", "novel-writing"]),
+        ("把代码部署到云服务器", "cloud_infrastructure", ["cloudstudio-deploy"]),
+        ("分析财报并画K线图", "finance_investment", ["finance_investment", "data_visualization"]),
+        ("帮我管理项目Sprint和OKR", "business_operations", []),
     ]
 
-    print("=" * 60)
-    print("  RAG Ranking Quality Test")
-    print("=" * 60)
+    print("=" * 70)
+    print("  Embedding RAG Ranking Quality Test")
+    print("=" * 70)
 
+    total = 0
+    domain_correct = 0
     for query, expected_domain, _ in test_cases:
-        print(f"\nQuery: {query}")
+        total += 1
+        print(f"\n[{total}] Query: {query}")
         result = route_query(query, data)
         domains = [d['name'] for d in result['matched_domains']]
-        print(f"  Matched domains: {domains}")
+        domain_name_map = {d['id']: d['name'] for d in data['domains']}
+        expected_name = domain_name_map.get(expected_domain, expected_domain)
+        match = "OK" if expected_domain in [d['id'] for d in result['matched_domains']] else "MISS"
+        if match == "OK":
+            domain_correct += 1
+        print(f"  Matched: {domains} (expect: {expected_name}) {match}")
         print(f"  Skills returned: {result['skill_count']}")
         if result['skills']:
             top3 = [(s['name'], s.get('rag_score', 0)) for s in result['skills'][:3]]
             for name, score in top3:
-                score_str = f"{score:.3f}" if score else "N/A"
-                print(f"    - {name} (RAG:{score_str})")
+                score_str = f"{score:.4f}" if score else "N/A"
+                print(f"    - {name} (Emb:{score_str})")
+        else:
+            print(f"    (no skills matched)")
+
+    print(f"\n{'=' * 70}")
+    print(f"  Domain routing accuracy: {domain_correct}/{total} ({domain_correct/total*100:.0f}%)")
 
 
 def main():

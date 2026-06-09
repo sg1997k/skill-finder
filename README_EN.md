@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-A **self-bootstrapping semantic skill discovery system**. First run auto-builds a domain knowledge graph index; subsequent queries find skills via natural language in < 1ms. No embedding API. Purely local. Works across platforms.
+A **self-bootstrapping semantic skill discovery system**. First run auto-builds a domain knowledge graph index + Sentence-Transformer embedding vectors; subsequent queries find skills via natural language in ~2-3s. Purely local. Works across platforms.
 
 ## The Problem
 
@@ -30,8 +30,10 @@ Layer 2 — Graph expansion (adjacent domains auto-join)
   Data Viz → adjacent → Content Design, Finance, Software Dev
   Candidates: 1836 → ~340 (81% reduction)
 
-Layer 3 — In-domain ranking (description matching)
-  Rank 340 candidates by relevance → return top-k
+Layer 3 — In-domain ranking (Embedding similarity)
+  Rank 340 candidates by embedding cosine similarity → return top-k
+  "预约腾讯会议" → tencent-meeting-mcp (0.912)
+  "发邮件通知" → qq-mail (0.864)
 ```
 
 ## 13 Semantic Domains
@@ -147,10 +149,12 @@ Currently scanned paths (existence auto-detected):
 ## Dependencies
 
 - Python 3.8+
-- **Zero pip packages** (built-in YAML frontmatter parser, no PyYAML needed)
+- `sentence-transformers` (auto-installed)
+- `numpy` (auto-installed)
 - Zero external API calls
-- Index size: ~200KB (for 1,800 skills)
-- Query latency: < 1ms
+- Embedding model: `intfloat/multilingual-e5-small` (~120MB, auto-downloaded)
+- Index size: `skill_domains.json` ~500KB + `embeddings.npy` ~2.7MB (for 1,877 skills)
+- Query latency: ~2-3s (including model inference)
 
 ## vs. find-skills
 

@@ -1,5 +1,9 @@
 # Generated at runtime
 data/skill_domains.json
+data/embeddings.npy
+
+# Downloaded embedding model (auto-downloaded on first run)
+data/model/
 
 # Python cache
 __pycache__/
