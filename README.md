@@ -60,13 +60,13 @@
 # 方式 1：作为 WorkBuddy skill 安装
 # 将 skill-finder/ 目录复制到 ~/.workbuddy/skills/
 
-git clone https://github.com/YOUR_USERNAME/skill-finder.git \
+git clone https://github.com/sg1997k/skill-finder.git \
   ~/.workbuddy/skills/skill-finder
 ```
 
 ```bash
 # 方式 2：独立使用（任何 Agent 工具）
-git clone https://github.com/YOUR_USERNAME/skill-finder.git
+git clone https://github.com/sg1997k/skill-finder.git
 cd skill-finder
 python scripts/bootstrap.py "帮我分析财报"
 ```
@@ -149,7 +149,7 @@ python scripts/bootstrap.py --rebuild
 ## 依赖
 
 - Python 3.8+
-- 无外部 pip 包（不依赖 PyYAML，使用内置字符串解析）
+- **零外部依赖**（无需任何 pip 包，内置 frontmatter 解析器）
 - 无外部 API 调用
 - 索引大小：约 200KB（1800 个 skill）
 - 查询延迟：< 1ms

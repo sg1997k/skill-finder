@@ -58,13 +58,13 @@ Auto-discovered from 1,836 marketplace skills (not pre-defined):
 
 ```bash
 # Option 1: As a WorkBuddy skill
-git clone https://github.com/YOUR_USERNAME/skill-finder.git \
+git clone https://github.com/sg1997k/skill-finder.git \
   ~/.workbuddy/skills/skill-finder
 ```
 
 ```bash
 # Option 2: Standalone (any agent tool)
-git clone https://github.com/YOUR_USERNAME/skill-finder.git
+git clone https://github.com/sg1997k/skill-finder.git
 cd skill-finder
 python scripts/bootstrap.py "analyze stock financials"
 ```
@@ -147,7 +147,7 @@ Currently scanned paths (existence auto-detected):
 ## Dependencies
 
 - Python 3.8+
-- Zero pip packages (uses built-in string parsing, no PyYAML needed)
+- **Zero pip packages** (built-in YAML frontmatter parser, no PyYAML needed)
 - Zero external API calls
 - Index size: ~200KB (for 1,800 skills)
 - Query latency: < 1ms

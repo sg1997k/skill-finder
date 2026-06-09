@@ -165,7 +165,7 @@ ls ~/.workbuddy/skills/{skill_name}/ 2>/dev/null && echo "installed" || echo "no
 
 | 情况 | 处理方式 |
 |---|---|
-| bootstrap.py 报 ModuleNotFoundError: yaml | 先运行 `pip install pyyaml`，再重试 |
+| bootstrap.py 运行失败 | 确认使用 Python 3.8+；脚本无需任何外部包 |
 | 脚本找不到任何 SKILL.md | 检查 `SKILL_SCAN_PATHS`，确认路径存在 |
 | 输出为空 JSON `{}` | 用户查询过短，引导用户补充描述 |
 | 安装失败 | 告知用户技能名，请用户手动安装 |
