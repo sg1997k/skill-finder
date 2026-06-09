@@ -113,6 +113,7 @@ DOMAINS = [
             "coding": 4, "stack": 2, "full-stack": 6,
             "nextjs": 10, "nodejs": 8, "nestjs": 10, "express": 6,
             "django": 8, "flask": 6, "fastapi": 8,
+            "软件": 6, "登录": 6, "表单": 6, "组件": 6, "模块": 2,
         }
     },
     {
@@ -233,6 +234,9 @@ DOMAINS = [
             "due diligence": 8, "dd meeting": 10,
             "internal comm": 8, "memo": 4, "announcement": 6,
             "stakeholder": 4, "executive": 2,
+            "销售": 10, "KPI": 10, "看板": 10, "绩效": 10,
+            "运营": 6, "客服": 8, "CRM": 8, "ERP": 8, "报销": 10,
+            "周报": 8, "月报": 8, "季度": 6,
         }
     },
     {
@@ -306,27 +310,38 @@ DOMAIN_ROUTING = {
                      "A股", "港股", "美股", "板块", "走势", "行情",
                      "消费板块", "科技股", "蓝筹", "成长股",
                      "季报", "年报", "业绩", "ROE", "PE", "PB", "EPS",
-                     "分析", "预测", "趋势", "大涨", "大跌", "崩盘", "泡沫",
-                     "主线", "题材", "热点", "龙头"],
+                     "大涨", "大跌", "崩盘", "泡沫",
+                     "主线", "题材", "热点", "龙头",
+                     "K线", "均线", "成交量", "MACD", "RSI",
+                     "基本面", "技术面", "资金流向"],
     },
     "data_visualization": {
         "trigger": ["画图", "图表", "可视化", "仪表盘", "作图", "绘图", "折线图",
-                     "柱状图", "饼图", "k线图", "趋势图", "map", "chart",
-                     "visualize", "graph", "plot", "dashboard"],
+                     "柱状图", "饼图", "K线图", "趋势图", "map", "chart",
+                     "visualize", "graph", "plot", "dashboard", "画图表",
+                     "数据图", "统计图", "走势图", "饼状图", "散点图",
+                     "画", "图"],   # standalone chars match "画个图", "画个"
     },
     "document_processing": {
         "trigger": ["word", "excel", "ppt", "pdf", "文档", "表格", "幻灯片",
                      "docx", "xlsx", "pptx", "转格式", "OCR", "markdown"],
     },
     "content_design": {
-        "trigger": ["设计", "海报", "配色", "画", "logo", "UI", "UX", "图",
-                     "图片", "视频", "生成", "创作", "文章", "写", "翻译",
-                     "design", "image", "video", "create", "generate"],
+        "trigger": ["设计", "海报", "配色", "logo", "UI", "UX",
+                     "图片", "视频", "翻译", "写作", "画画", "画海报",
+                     "画设计", "写文章", "写文案", "写小说", "公众号",
+                     "排版", "字体", "品牌设计", "VI",
+                     "design", "image", "video", "create", "generate",
+                     "thumbnail", "mockup", "wireframe", "typography"],
     },
     "software_development": {
         "trigger": ["编程", "代码", "开发", "API", "框架", "测试", "部署",
                      "重构", "debug", "架构", "接口", "code", "program",
-                     "develop", "framework", "test", "deploy", "refactor"],
+                     "develop", "framework", "test", "deploy", "refactor",
+                     "React", "Vue", "Angular", "Node.js", "TypeScript",
+                     "组件", "登录", "表单", "npm", "Git", "后端", "前端",
+                     "全栈", "微服务", "数据库", "SQL", "REST", "GraphQL",
+                     "Docker", "Kubernetes", "CI/CD", "Python脚本"],
     },
     "data_science_ml": {
         "trigger": ["机器学习", "深度学习", "模型", "训练", "预测", "数据分析",
@@ -334,9 +349,11 @@ DOMAIN_ROUTING = {
                      "特征", "数据集", "machine learning", "train", "predict"],
     },
     "business_operations": {
-        "trigger": ["项目", "管理", "审计", "法律", "合同", "合规", "发票",
+        "trigger": ["项目管理", "审计", "法律", "合同", "合规", "发票",
                      "HR", "招聘", "简历", "OKR", "agile", "sprint", "流程",
-                     "运营", "manage", "project", "audit", "legal", "hr"],
+                     "运营", "manage", "project", "audit", "legal", "hr",
+                     "销售", "KPI", "看板", "绩效", "敏捷", "报销",
+                     "周报", "月报", "季度报告", "考勤", "入职", "面试"],
     },
     "communication": {
         "trigger": ["邮件", "通知", "消息", "通讯", "日程", "会议记录",
@@ -642,18 +659,41 @@ DOMAIN_EXEC_ORDER = {
 }
 
 
+# Multi-intent filtering: only keep domains with score >= ratio of max score
+MULTI_INTENT_SCORE_RATIO = 0.25  # keep domain if score >= 25% of top domain
+MAX_DOMAINS = 3                  # cap total domains for multi-intent
+
+
 def detect_multi_intent(query, domain_scores):
     """
     Detect if the query has multiple intents requiring multiple skills.
+    Filters weak domain matches using relative score threshold.
     Returns list of (domain_id, score) sorted by execution order.
-    Always returns a list of tuples, never a dict.
+    Always returns a list of tuples.
     """
+    if not domain_scores:
+        return []
+
     items = list(domain_scores.items())
-    if len(items) <= 1:
+    if len(items) == 1:
         return items
 
-    # Sort by execution order (not by score) for multi-intent
-    ordered = sorted(items, key=lambda x: DOMAIN_EXEC_ORDER.get(x[0], 99))
+    # Filter: only keep domains with score >= threshold
+    max_score = max(s for _, s in items)
+    threshold = max_score * MULTI_INTENT_SCORE_RATIO
+    filtered = [(did, s) for did, s in items if s >= threshold]
+
+    # Cap at MAX_DOMAINS
+    if len(filtered) > MAX_DOMAINS:
+        filtered.sort(key=lambda x: -x[1])
+        filtered = filtered[:MAX_DOMAINS]
+
+    # If only one survives filtering → single intent
+    if len(filtered) <= 1:
+        return filtered
+
+    # Sort by execution order for multi-intent
+    ordered = sorted(filtered, key=lambda x: DOMAIN_EXEC_ORDER.get(x[0], 99))
     return ordered
 
 
