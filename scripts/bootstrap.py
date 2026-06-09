@@ -1,33 +1,39 @@
 #!/usr/bin/env python3
 """
-Skill Finder — Self-Bootstrapping Semantic Domain Router
+Skill Finder — Self-Bootstrapping Semantic Domain Router with RAG
 
-First run: scans all SKILL.md files, extracts frontmatter, classifies into 13
-semantic domains, builds a knowledge graph adjacency index, and saves it to
-data/skill_domains.json.
+First run: scans all SKILL.md files, extracts frontmatter, classifies into
+semantic domains, builds TF-IDF corpus for in-domain RAG re-ranking,
+saves index to data/skill_domains.json.
 
 Subsequent runs: loads cached index, routes query via keyword + graph expansion,
-returns ranked skill list. Incrementally re-indexes changed files.
+then re-ranks within matched domains using TF-IDF cosine similarity.
+Supports multi-intent queries (e.g. "analyze data and draw a chart") by
+returning ordered skills from multiple domains.
 
 Usage:
     python bootstrap.py "帮我分析财报"          # Route a query
     python bootstrap.py --rebuild               # Force full rebuild
     python bootstrap.py --stats                 # Show domain statistics
     python bootstrap.py --list-domains          # List all domains
+    python bootstrap.py --test-rag              # Test RAG ranking quality
 """
 
 import json
 import os
+import re
 import sys
 import time
+import math
 from collections import Counter, defaultdict
 from pathlib import Path
 
-# ── Configuration ──────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 DATA_DIR = SKILL_DIR / "data"
 INDEX_FILE = DATA_DIR / "skill_domains.json"
+TFIDF_FILE = DATA_DIR / "tfidf_cache.json"
 
 # Paths to scan for SKILL.md files (platform-agnostic)
 HOME = Path.home()
@@ -49,7 +55,7 @@ DOMAINS = [
             "财报": 10, "财务": 10, "分红": 10, "估值": 10, "选股": 10,
             "仓位": 10, "收益率": 10, "股息": 8, "期货": 8, "CTA": 8,
             "证券": 8, "期权": 8, "对冲": 8, "量化": 8, "IPO": 8,
-            "equity": 10, "portfolio": 10, "investment": 10, "trading": 10,
+            "equity": 10, "portfolio": 10, "invest": 10, "trading": 10,
             "financial": 8, "earnings": 10, "dividend": 10, "market": 6,
             "stock": 10, "fund": 10, "bond": 8, "crypto": 8,
             "revenue": 6, "balance sheet": 10, "income statement": 10,
@@ -78,7 +84,7 @@ DOMAINS = [
             "genome": 12, "ensembl": 12, "BRENDA": 12, "PubChem": 12,
             "OpenTargets": 12, "sequencing": 10, "pathway": 8,
             "cheminformatics": 10, "QSAR": 10, "featurizer": 8,
-            "phylogenetic": 12, "taxonomy": 6, "opentrons": 12,
+            "phylogenetic": 12, "taxonomy": 6, "operons": 12,
             "protocol": 2, "lab": 4, "assay": 8, "screening": 2,
             "molecular": 10, "biotech": 10, "compounds": 8,
             "bioactivity": 10, "ligand": 10, "binding": 6,
@@ -183,7 +189,7 @@ DOMAINS = [
             "image": 8, "video": 10, "animation": 10, "generate": 2,
             "palette": 10, "design": 4, "photo": 8, "illustration": 10,
             "UX": 10, "UI": 8, "mockup": 10, "wireframe": 10,
-            "prototype": 8, "Figma": 10, "sketch": 6,
+            "prototype": 8, "Figma": 10, "Sketch": 6,
             "typography": 8, "accessibility": 4, "WCAG": 8,
             "brand": 6, "logo": 8, "content": 2, "copy": 4,
             "marketing": 4, "campaign": 6, "social media": 4,
@@ -222,7 +228,7 @@ DOMAINS = [
             "workpaper": 10, "variance": 4, "FP&A": 10,
             "planning": 2, "project management": 8,
             "scrum": 10, "kanban": 8, "standup": 8,
-            "legal": 8, "contract": 8, "compliance": 8,
+            "legal": 10, "contract": 8, "compliance": 8,
             "risk management": 6, "GRC": 10,
             "due diligence": 8, "dd meeting": 10,
             "internal comm": 8, "memo": 4, "announcement": 6,
@@ -278,13 +284,13 @@ DOMAIN_ADJACENCY = {
     "finance_investment":       ["business_operations", "data_science_ml", "data_visualization"],
     "life_sciences":            ["academic_research", "data_science_ml"],
     "software_development":     ["cloud_infrastructure", "data_science_ml", "workbuddy_meta"],
-    "data_science_ml":          ["data_visualization", "software_development", "finance_investment"],
+    "data_science_ml":         ["data_visualization", "software_development", "finance_investment"],
     "document_processing":      ["content_design", "business_operations"],
     "data_visualization":       ["content_design", "finance_investment", "software_development"],
     "communication":            ["business_operations", "workbuddy_meta"],
     "content_design":           ["data_visualization", "document_processing", "software_development"],
     "academic_research":        ["life_sciences", "data_science_ml"],
-    "business_operations":      ["finance_investment", "communication", "document_processing"],
+    "business_operations":       ["finance_investment", "communication", "document_processing"],
     "cloud_infrastructure":     ["software_development", "communication"],
     "game_development":         ["software_development", "content_design"],
     "workbuddy_meta":           ["software_development", "communication"],
@@ -355,7 +361,120 @@ DOMAIN_ROUTING = {
 
 MIN_SCORE = 8
 
-# ── YAML Frontmatter Extraction ────────────────────────────────────────────
+# ── Zero-Dependency TF-IDF Semantic Similarity ────────────────────────
+#
+# Tokenizer: splits on word boundaries + extracts Chinese characters.
+# IDF is computed once at index build time and cached.
+# Cosine similarity of TF-IDF vectors gives semantic ranking.
+# Handles both Chinese and English text.
+
+def tokenize(text):
+    """
+    Tokenize text into words + Chinese character bigrams.
+    Uses character-level bigrams for Chinese (captures more semantic signal
+    than single chars), and word-level tokens for ASCII.
+    Returns a list of tokens.
+    """
+    if not text:
+        return []
+    text = text.lower()
+    tokens = []
+
+    # Extract ASCII words (English, numbers, coding terms)
+    for word in re.findall(r'[a-z0-9_]+', text):
+        if len(word) >= 2:
+            tokens.append(word)
+
+    # Extract Chinese characters
+    chinese_chars = [ch for ch in text if '\u4e00' <= ch <= '\u9fff']
+
+    # Add single Chinese chars
+    for ch in chinese_chars:
+        tokens.append(ch)
+
+    # Add Chinese character bigrams (captures local word semantics)
+    for i in range(len(chinese_chars) - 1):
+        tokens.append(chinese_chars[i] + chinese_chars[i + 1])
+
+    return tokens
+
+
+def build_idf(skills):
+    """
+    Build IDF (Inverse Document Frequency) from all skill descriptions.
+    Returns: { token: idf_value }
+    """
+    N = len(skills)
+    doc_freq = Counter()
+
+    for skill in skills:
+        desc = skill.get('description', '') or ''
+        name = skill.get('name', '') or ''
+        text = desc + ' ' + name
+        tokens = set(tokenize(text))
+        for t in tokens:
+            doc_freq[t] += 1
+
+    idf = {}
+    for token, df in doc_freq.items():
+        if df > 0:
+            idf[token] = math.log((N + 1) / (df + 1)) + 1  # smooth
+    return idf
+
+
+def tfidf_vector(text, idf):
+    """
+    Compute TF-IDF vector as a Counter { token: tfidf }.
+    Only includes tokens present in the IDF vocabulary.
+    """
+    tokens = tokenize(text)
+    if not tokens:
+        return Counter()
+    tf = Counter(tokens)
+    max_tf = max(tf.values())
+    vec = Counter()
+    for t, cnt in tf.items():
+        if t in idf:
+            tf_norm = cnt / max_tf
+            vec[t] = tf_norm * idf[t]
+    return vec
+
+
+def cosine_similarity(vec1, vec2):
+    """Cosine similarity between two Counter vectors."""
+    if not vec1 or not vec2:
+        return 0.0
+    dot = sum(vec1[t] * vec2.get(t, 0) for t in vec1)
+    norm1 = math.sqrt(sum(v * v for v in vec1.values()))
+    norm2 = math.sqrt(sum(v * v for v in vec2.values()))
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return dot / (norm1 * norm2)
+
+
+def semantic_rank(query, skills, idf, top_n=20):
+    """
+    Rank skills by semantic similarity to the query using TF-IDF cosine.
+    Returns list of (skill, score) sorted by descending score.
+    """
+    query_vec = tfidf_vector(query, idf)
+    if not query_vec:
+        return [(s, 0.0) for s in skills]
+
+    scored = []
+    for skill in skills:
+        desc = skill.get('description', '') or ''
+        name = skill.get('name', '') or ''
+        text = desc + ' ' + name
+        skill_vec = tfidf_vector(text, idf)
+        sim = cosine_similarity(query_vec, skill_vec)
+        scored.append((skill, sim))
+
+    scored.sort(key=lambda x: -x[1])
+    return scored[:top_n]
+
+
+# ── YAML Frontmatter Extraction ──────────────────────────────────────────
 
 def extract_frontmatter(filepath):
     """Extract YAML frontmatter from a SKILL.md file without pyyaml dependency."""
@@ -392,7 +511,7 @@ def scan_skills():
     for scan_path in SKILL_SCAN_PATHS:
         if not scan_path.exists():
             continue
-        for root, dirs, files in os.walk(scan_path):
+        for root, _, files in os.walk(scan_path):
             for f in files:
                 if f == 'SKILL.md':
                     filepath = Path(root) / f
@@ -412,7 +531,7 @@ def scan_skills():
     return skills
 
 
-# ── Domain Classification ──────────────────────────────────────────────────
+# ── Domain Classification ─────────────────────────────────────────────────────
 
 def classify_skill(desc, name):
     """Classify a skill into primary + secondary domains."""
@@ -438,7 +557,7 @@ def classify_skill(desc, name):
 
 
 def build_index(force=False):
-    """Build or rebuild the domain index."""
+    """Build or rebuild the domain index, including TF-IDF cache."""
     if not force and INDEX_FILE.exists():
         cached = _load_index()
         if cached:
@@ -467,6 +586,11 @@ def build_index(force=False):
             'secondary_domains': secondary,
         })
 
+    # Build TF-IDF IDF cache for semantic ranking
+    print("Building TF-IDF semantic index...", file=sys.stderr)
+    idf = build_idf(results)
+    print(f"TF-IDF vocabulary size: {len(idf)}", file=sys.stderr)
+
     output = {
         'built_at': time.time(),
         'total_skills': len(skills),
@@ -474,6 +598,7 @@ def build_index(force=False):
         'skills': results,
         'summary': {d['id']: {'name': d['name'], 'count': domain_counts[d['id']]} for d in DOMAINS},
         'other_count': domain_counts['other'],
+        'tfidf_idf': idf,   # cached IDF for query-time ranking
     }
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -496,10 +621,51 @@ def _load_index():
         return None
 
 
-# ── Query Routing ──────────────────────────────────────────────────────────
+# ── Multi-Intent Detection ────────────────────────────────────────────────
 
-def route_query(query, data, expand_depth=1):
-    """Route a query to domains and return matching skills."""
+# Domain execution order heuristic:
+# Research/Input → Analysis → Processing → Visualization → Output
+DOMAIN_EXEC_ORDER = {
+    "academic_research":        1,
+    "life_sciences":            1,
+    "document_processing":      2,
+    "finance_investment":       3,
+    "data_science_ml":         3,
+    "software_development":     3,
+    "business_operations":      4,
+    "data_visualization":      5,
+    "content_design":          5,
+    "communication":           6,
+    "cloud_infrastructure":     6,
+    "game_development":        6,
+    "workbuddy_meta":          7,
+}
+
+
+def detect_multi_intent(query, domain_scores):
+    """
+    Detect if the query has multiple intents requiring multiple skills.
+    Returns list of (domain_id, score) sorted by execution order.
+    Always returns a list of tuples, never a dict.
+    """
+    items = list(domain_scores.items())
+    if len(items) <= 1:
+        return items
+
+    # Sort by execution order (not by score) for multi-intent
+    ordered = sorted(items, key=lambda x: DOMAIN_EXEC_ORDER.get(x[0], 99))
+    return ordered
+
+
+# ── Query Routing (Enhanced) ─────────────────────────────────────────────
+
+def route_query(query, data, expand_depth=1, use_rag=True):
+    """
+    Route a query to domains and return matching skills.
+    Enhanced with:
+      - Multi-intent detection (returns skills from multiple domains in exec order)
+      - In-domain RAG re-ranking (TF-IDF semantic similarity)
+    """
     query_lower = query.lower()
 
     # Step 1: Match query to domains via trigger keywords
@@ -521,11 +687,12 @@ def route_query(query, data, expand_depth=1):
             'message': '未匹配到领域。尝试用更具体的关键词描述你的需求。'
         }
 
-    sorted_domains = sorted(domain_scores.items(), key=lambda x: -x[1])
-    primary = [d[0] for d in sorted_domains]
+    # Step 2: Determine if multi-intent
+    sorted_domains = detect_multi_intent(query, domain_scores)
+    primary_ids = [d[0] for d in sorted_domains]
 
-    # Step 2: Expand to adjacent domains (KG walk)
-    expanded = set(primary)
+    # Step 3: Expand to adjacent domains (KG walk)
+    expanded = set(primary_ids)
     for _ in range(expand_depth):
         new_domains = set()
         for d in expanded:
@@ -535,33 +702,101 @@ def route_query(query, data, expand_depth=1):
                     new_domains.add(n)
         expanded.update(new_domains)
 
-    # Step 3: Collect skills in matched domains
+    # Step 4: Collect skills in matched domains (in execution order for multi-intent)
     domain_name_map = {d['id']: d['name'] for d in data['domains']}
     all_skills = []
     seen = set()
+    execution_plan = []
 
-    for skill in data['skills']:
-        if skill['primary_domain'] in expanded:
-            if skill['name'] not in seen:
-                seen.add(skill['name'])
+    # For multi-intent: return top skills from each matched domain in order
+    if len(primary_ids) > 1:
+        for domain_id in primary_ids:
+            domain_skills = [s for s in data['skills']
+                            if s['primary_domain'] == domain_id and s['name'] not in seen]
+            # RAG re-ranking within domain
+            if use_rag and domain_skills:
+                idf = data.get('tfidf_idf', {})
+                ranked = semantic_rank(query, domain_skills, idf, top_n=5)
+                step_skills = []
+                for skill, score in ranked:
+                    if skill['name'] not in seen:
+                        seen.add(skill['name'])
+                        skill['rag_score'] = round(score, 4)
+                        step_skills.append(skill)
+                        all_skills.append(skill)
+            else:
+                step_skills = []
+                for s in domain_skills[:5]:
+                    if s['name'] not in seen:
+                        seen.add(s['name'])
+                        step_skills.append(s)
+                        all_skills.append(s)
+            execution_plan.append({
+                'step': len(execution_plan) + 1,
+                'domain': domain_id,
+                'domain_name': domain_name_map.get(domain_id, domain_id),
+                'skills': [s['name'] for s in step_skills],
+            })
+    else:
+        # Single intent: collect all skills in expanded domains, RAG re-rank
+        for skill in data['skills']:
+            if skill['primary_domain'] in expanded:
+                if skill['name'] not in seen:
+                    seen.add(skill['name'])
+                    all_skills.append(skill)
+
+        if use_rag and all_skills:
+            idf = data.get('tfidf_idf', {})
+            ranked = semantic_rank(query, all_skills, idf, top_n=20)
+            all_skills = []
+            for skill, score in ranked:
+                skill['rag_score'] = round(score, 4)
                 all_skills.append(skill)
 
-    # Step 4: Rank by description relevance
-    def relevance(skill):
-        desc = (skill.get('description', '') + ' ' + skill.get('name', '')).lower()
-        return sum(1 for kw in query_lower.split() if kw in desc)
-
-    all_skills.sort(key=relevance, reverse=True)
-
     return {
-        'matched_domains': [{'id': d, 'name': domain_name_map.get(d, d)} for d in primary],
+        'query': query,
+        'matched_domains': [{'id': d, 'name': domain_name_map.get(d, d)} for d in primary_ids],
         'expanded_domains': [{'id': d, 'name': domain_name_map.get(d, d)} for d in sorted(expanded)],
+        'is_multi_intent': len(primary_ids) > 1,
+        'execution_plan': execution_plan,   # NEW: ordered steps for multi-intent
         'skill_count': len(all_skills),
-        'skills': all_skills[:50],  # top 50
+        'skills': all_skills[:50],
     }
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────
+
+def format_results(result, top_n=10):
+    """Pretty-print routing results."""
+    if 'message' in result:
+        return result['message']
+
+    md = result['matched_domains']
+    ed = result['expanded_domains']
+    multi = result.get('is_multi_intent', False)
+
+    lines = []
+    lines.append(f"[主领域] 直接命中: {', '.join(d['name'] for d in md)}")
+    lines.append(f"[扩展域] 邻接扩展: {', '.join(d['name'] for d in ed)}")
+    if multi:
+        lines.append("[模式] 多意图检测：按执行顺序返回跨领域 skill")
+    lines.append(f"[候选] skill 数: {result['skill_count']} (从 1836 缩小到 {result['skill_count']})")
+    lines.append("")
+    lines.append(f"Top {top_n} skills in matched domains:")
+
+    for s in result['skills'][:top_n]:
+        domain_name = s.get('primary_domain_name', '')
+        secondary = ', '.join(s.get('secondary_domains', []))
+        extra = f" [also: {secondary}]" if secondary else ""
+        rag = s.get('rag_score', '')
+        rag_str = f" [RAG:{rag:.3f}]" if rag else ""
+        lines.append(f"  * {s['name']} ({domain_name}{extra}){rag_str}")
+
+    if len(result['skills']) > top_n:
+        lines.append(f"  ... and {len(result['skills']) - top_n} more")
+
+    return "\n".join(lines)
+
 
 def print_stats(data):
     """Print domain statistics."""
@@ -575,6 +810,8 @@ def print_stats(data):
         name = d['name']
         print(f"  {name:20s}  {cnt:5d} skills")
     print(f"  {'其他':20s}  {data['other_count']:5d} skills")
+    idf_size = len(data.get('tfidf_idf', {}))
+    print(f"\n  TF-IDF vocabulary: {idf_size} tokens")
 
 
 def print_domains(data):
@@ -586,9 +823,36 @@ def print_domains(data):
         print(f"{d['name']}  <->  {', '.join(nbr_names)}")
 
 
+def test_rag_quality(data):
+    """Test RAG ranking quality with sample queries."""
+    test_cases = [
+        ("分析A股消费板块走势", "finance_investment", ["westock-data", "neodata-financial-search"]),
+        ("画个K线图", "data_visualization", ["data_visualization"]),
+        ("帮我发一封邮件", "communication", ["qq-mail"]),
+        ("写一个React登录组件", "software_development", ["software_development"]),
+        ("分析财报并画图表", "finance_investment", ["finance_investment", "data_visualization"]),
+    ]
+
+    print("=" * 60)
+    print("  RAG Ranking Quality Test")
+    print("=" * 60)
+
+    for query, expected_domain, _ in test_cases:
+        print(f"\nQuery: {query}")
+        result = route_query(query, data)
+        domains = [d['name'] for d in result['matched_domains']]
+        print(f"  Matched domains: {domains}")
+        print(f"  Skills returned: {result['skill_count']}")
+        if result['skills']:
+            top3 = [(s['name'], s.get('rag_score', 0)) for s in result['skills'][:3]]
+            for name, score in top3:
+                score_str = f"{score:.3f}" if score else "N/A"
+                print(f"    - {name} (RAG:{score_str})")
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python bootstrap.py <query> | --rebuild | --stats | --list-domains", file=sys.stderr)
+        print("Usage: python bootstrap.py <query> | --rebuild | --stats | --list-domains | --test-rag", file=sys.stderr)
         sys.exit(1)
 
     arg = sys.argv[1]
@@ -604,6 +868,10 @@ def main():
     elif arg == '--list-domains':
         data = build_index()
         print_domains(data)
+
+    elif arg == '--test-rag':
+        data = build_index()
+        test_rag_quality(data)
 
     else:
         query = ' '.join(sys.argv[1:])
